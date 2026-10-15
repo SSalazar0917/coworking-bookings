@@ -10,12 +10,15 @@ const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL ?? 'postgr
 const app = buildApp(pool, 'test-secret-that-is-at-least-32-chars!!');
 
 // Booking tests skip register/login (and its scrypt cost): insert the user and sign a token directly.
-const user = async (name: string) => {
-  const { rows } = await pool.query(`INSERT INTO users (email, password_hash) VALUES ($1, 'unused') RETURNING id`, [
-    `${name}@test.dev`,
-  ]);
+const user = async (name: string, role: 'member' | 'admin' = 'member') => {
+  const { rows } = await pool.query(
+    `INSERT INTO users (email, password_hash, role) VALUES ($1, 'unused', $2) RETURNING id`,
+    [`${name}@test.dev`, role],
+  );
   return app.jwt.sign({ sub: String(rows[0].id) });
 };
+const call = (token: string, method: 'GET' | 'POST' | 'PATCH', url: string, payload?: object) =>
+  app.inject({ method, url, headers: { authorization: `Bearer ${token}` }, payload });
 
 const hour = (h: number) => new Date(Date.UTC(2030, 0, 1, h)).toISOString();
 const hold = (token: string, start: number, end: number, resourceId = 1) =>
@@ -140,4 +143,88 @@ test('malformed JSON is a 400, not a 500', async () => {
     method: 'POST', url: '/auth/login', headers: { 'content-type': 'application/json' }, payload: '{bad',
   });
   assert.equal(res.statusCode, 400);
+});
+
+test('only admins manage resources', async () => {
+  const [member, admin] = await Promise.all([user('m'), user('admin', 'admin')]);
+  assert.equal((await call(member, 'POST', '/resources', { name: 'Sala B' })).statusCode, 403);
+  assert.equal((await call(member, 'PATCH', '/resources/1', { name: 'Hacked' })).statusCode, 403);
+
+  const created = await call(admin, 'POST', '/resources', { name: '  Sala B  ' });
+  assert.equal(created.statusCode, 201);
+  assert.deepEqual(created.json(), { id: 2, name: 'Sala B', isActive: true });
+  assert.equal((await call(admin, 'PATCH', '/resources/2', { name: 'Sala Azul' })).json().name, 'Sala Azul');
+  assert.equal((await call(admin, 'PATCH', '/resources/2', {})).statusCode, 400);
+  assert.equal((await call(admin, 'PATCH', '/resources/2', { role: 'x' })).statusCode, 400);
+  assert.equal((await call(admin, 'PATCH', '/resources/999', { name: 'x' })).statusCode, 404);
+});
+
+test('a deactivated resource is hidden from members and cannot be booked', async () => {
+  const [member, admin] = await Promise.all([user('m'), user('admin', 'admin')]);
+  const existing = (await hold(member, 10, 11)).json();
+  assert.equal((await call(admin, 'PATCH', '/resources/1', { isActive: false })).json().isActive, false);
+
+  assert.equal((await hold(member, 12, 13)).statusCode, 404);
+  assert.deepEqual((await call(member, 'GET', '/resources')).json(), []);
+  assert.equal((await call(admin, 'GET', '/resources')).json().length, 1);
+  const window = `from=${encodeURIComponent(hour(0))}&to=${encodeURIComponent(hour(23))}`;
+  assert.equal((await call(member, 'GET', `/resources/1/availability?${window}`)).statusCode, 404);
+  // Existing bookings survive deactivation; cancelling them is an explicit admin decision.
+  assert.equal((await call(member, 'GET', '/bookings')).json()[0].id, existing.id);
+});
+
+test('availability returns live busy slots without revealing who booked', async () => {
+  const [a, b, c, d] = await Promise.all([user('a'), user('b'), user('c'), user('d')]);
+  const confirmed = (await hold(a, 9, 10)).json();
+  await act(a, confirmed.id, 'confirm');
+  await hold(b, 11, 12); // live hold
+  const stale = (await hold(c, 13, 14)).json();
+  await pool.query(`UPDATE bookings SET hold_expires_at = now() - interval '1 second' WHERE id = $1`, [stale.id]);
+  const cancelled = (await hold(d, 15, 16)).json();
+  await act(d, cancelled.id, 'cancel');
+
+  const q = (from: string, to: string) =>
+    call(a, 'GET', `/resources/1/availability?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+  const res = await q(hour(0), hour(23));
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(
+    res.json().map((s: any) => [s.start, s.end]),
+    [[hour(9), hour(10)], [hour(11), hour(12)]].map(([s, e]) => [new Date(s).toISOString(), new Date(e).toISOString()]),
+  );
+  assert.deepEqual(Object.keys(res.json()[0]).sort(), ['end', 'start']);
+
+  assert.equal((await q(hour(10), hour(9))).statusCode, 400);
+  assert.equal((await q('2030-01-01T00:00:00Z', '2030-03-01T00:00:00Z')).statusCode, 400);
+});
+
+test('members list their own bookings; only admins list all', async () => {
+  const [a, b, admin] = await Promise.all([user('a'), user('b'), user('admin', 'admin')]);
+  const mine = (await hold(a, 10, 11)).json();
+  await hold(b, 12, 13);
+  await pool.query(`UPDATE bookings SET hold_expires_at = now() - interval '1 second' WHERE id = $1`, [mine.id]);
+
+  const own = (await call(a, 'GET', '/bookings')).json();
+  assert.deepEqual(own.map((x: any) => x.id), [mine.id]);
+  assert.equal(own[0].status, 'EXPIRED', 'stale holds read as expired even before cleanup');
+  assert.equal((await call(a, 'GET', '/bookings?scope=all')).statusCode, 403);
+  assert.equal((await call(admin, 'GET', '/bookings?scope=all')).json().length, 2);
+  assert.equal((await call(a, 'GET', '/bookings?scope=everything')).statusCode, 400);
+});
+
+test('admins can cancel any booking, members only their own', async () => {
+  const [a, b, admin] = await Promise.all([user('a'), user('b'), user('admin', 'admin')]);
+  const booking = (await hold(a, 10, 11)).json();
+  assert.equal((await act(b, booking.id, 'cancel')).statusCode, 404);
+  assert.equal((await act(admin, booking.id, 'confirm')).statusCode, 404, 'admins cannot confirm for others');
+  const cancelled = await act(admin, booking.id, 'cancel');
+  assert.equal(cancelled.statusCode, 200);
+  assert.equal(cancelled.json().status, 'CANCELLED');
+  assert.equal((await act(admin, booking.id, 'cancel')).statusCode, 409);
+});
+
+test('demoting an admin takes effect immediately, even with an old token', async () => {
+  const admin = await user('admin', 'admin');
+  assert.equal((await call(admin, 'POST', '/resources', { name: 'X' })).statusCode, 201);
+  await pool.query(`UPDATE users SET role = 'member' WHERE email = 'admin@test.dev'`);
+  assert.equal((await call(admin, 'POST', '/resources', { name: 'Y' })).statusCode, 403);
 });

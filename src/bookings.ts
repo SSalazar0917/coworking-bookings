@@ -8,7 +8,9 @@ export class DomainError extends Error {
   }
 }
 
-const COLUMNS = `id, resource_id AS "resourceId", user_id AS "userId", status,
+// Stale holds are only marked EXPIRED lazily, so report them as expired on read.
+const COLUMNS = `id, resource_id AS "resourceId", user_id AS "userId",
+  CASE WHEN status = 'HELD' AND hold_expires_at <= now() THEN 'EXPIRED' ELSE status END AS status,
   lower(booking_range) AS "start", upper(booking_range) AS "end", hold_expires_at AS "holdExpiresAt"`;
 
 export async function createHold(
@@ -21,7 +23,9 @@ export async function createHold(
     // Queue writers per resource. Without this, concurrent inserts each see the other's uncommitted
     // row in the exclusion check, wait on each other and Postgres aborts them with deadlocks (40P01)
     // instead of a clean 23P01. The constraint still guarantees integrity; this only orders contenders.
-    const resource = await client.query('SELECT 1 FROM resources WHERE id = $1 FOR NO KEY UPDATE', [input.resourceId]);
+    const resource = await client.query('SELECT 1 FROM resources WHERE id = $1 AND is_active FOR NO KEY UPDATE', [
+      input.resourceId,
+    ]);
     if (!resource.rows[0]) throw new DomainError(404, 'RESOURCE_NOT_FOUND', 'Resource not found');
     // Free stale holds on this slot first; the exclusion constraint cannot look at now().
     await client.query(
@@ -60,20 +64,36 @@ export async function confirmHold(pool: Pool, id: number, userId: number) {
   throw await explainMiss(pool, id, userId, 'Only an unexpired HELD booking can be confirmed');
 }
 
-export async function cancelBooking(pool: Pool, id: number, userId: number) {
+// Admins may cancel anyone's booking (e.g. a room closes for maintenance).
+export async function cancelBooking(pool: Pool, id: number, userId: number, asAdmin = false) {
   const { rows } = await pool.query(
     `UPDATE bookings SET status = 'CANCELLED', hold_expires_at = NULL
-      WHERE id = $1 AND user_id = $2 AND status IN ('HELD', 'CONFIRMED')
+      WHERE id = $1 AND (user_id = $2 OR $3) AND status IN ('HELD', 'CONFIRMED')
       RETURNING ${COLUMNS}`,
-    [id, userId],
+    [id, userId, asAdmin],
   );
   if (rows[0]) return rows[0];
-  throw await explainMiss(pool, id, userId, 'Booking is not active');
+  throw await explainMiss(pool, id, userId, 'Booking is not active', asAdmin);
+}
+
+// userId = null lists everyone's bookings (admin view).
+export async function listBookings(pool: Pool, userId: number | null) {
+  // shortcut: newest 200 only, add from/to filters + pagination when a calendar view needs them.
+  const { rows } = await pool.query(
+    `SELECT ${COLUMNS} FROM bookings WHERE $1::int IS NULL OR user_id = $1
+      ORDER BY lower(booking_range) DESC LIMIT 200`,
+    [userId],
+  );
+  return rows;
 }
 
 // Turns a 0-row UPDATE into 404 (missing or someone else's) vs 409 (wrong state).
-async function explainMiss(pool: Pool, id: number, userId: number, conflictMsg: string) {
-  const { rows } = await pool.query('SELECT 1 FROM bookings WHERE id = $1 AND user_id = $2', [id, userId]);
+async function explainMiss(pool: Pool, id: number, userId: number, conflictMsg: string, asAdmin = false) {
+  const { rows } = await pool.query('SELECT 1 FROM bookings WHERE id = $1 AND (user_id = $2 OR $3)', [
+    id,
+    userId,
+    asAdmin,
+  ]);
   return rows[0]
     ? new DomainError(409, 'INVALID_STATE', conflictMsg)
     : new DomainError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
