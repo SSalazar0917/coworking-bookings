@@ -71,15 +71,26 @@ The constraint still guarantees integrity; the lock only puts contenders in line
 
 ## API
 
-All booking endpoints require `Authorization: Bearer <token>`.
+Everything except `/auth/*` requires `Authorization: Bearer <token>`. There are two roles: **member** (default) and **admin**.
 
-| Method | Path | Body | Responses |
-|---|---|---|---|
-| `POST` | `/auth/register` | `{ email, password }` | `201` user · `400` invalid · `409` email taken |
-| `POST` | `/auth/login` | `{ email, password }` | `200 { token }` · `401` invalid credentials |
-| `POST` | `/bookings` | `{ resourceId, start, end }` (ISO 8601 with offset) | `201` hold · `400` invalid · `404` no resource · `409` slot taken |
-| `POST` | `/bookings/:id/confirm` | — | `200` · `404` not found / not yours · `409` not an active hold |
-| `POST` | `/bookings/:id/cancel` | — | `200` · `404` · `409` not active |
+| Method | Path | Who | Body / query | Responses |
+|---|---|---|---|---|
+| `POST` | `/auth/register` | anyone | `{ email, password }` | `201` user · `400` · `409` email taken |
+| `POST` | `/auth/login` | anyone | `{ email, password }` | `200 { token }` · `401` |
+| `GET` | `/resources` | member | — | active resources (admins also see inactive) |
+| `POST` | `/resources` | admin | `{ name }` | `201` · `403` |
+| `PATCH` | `/resources/:id` | admin | `{ name?, isActive? }` | `200` · `403` · `404` |
+| `GET` | `/resources/:id/availability` | member | `?from&to` (≤ 31 days) | busy `[{ start, end }]` · `404` inactive/missing |
+| `POST` | `/bookings` | member | `{ resourceId, start, end }` (ISO 8601 with offset) | `201` hold · `400` · `404` · `409` slot taken |
+| `GET` | `/bookings` | member | `?scope=mine` (default) or `all` (admin) | newest 200 · `403` |
+| `POST` | `/bookings/:id/confirm` | owner | — | `200` · `404` · `409` not an active hold |
+| `POST` | `/bookings/:id/cancel` | owner or admin | — | `200` · `404` · `409` not active |
+
+Permission decisions:
+- **The role is read from the database on every admin request, not from the JWT.** Demoting an admin takes effect immediately instead of when their token expires (tested).
+- **Availability returns only time ranges**, never who booked, so members can't see each other's schedules.
+- **Resources are deactivated, never deleted**, because bookings reference them. Deactivating doesn't cancel existing bookings; an admin decides that explicitly.
+- **Admins can cancel anyone's booking but can't confirm on someone's behalf.** Confirming is the member's commitment.
 
 Security notes:
 - Passwords are hashed with `scrypt` (Node's built-in crypto) with a per-user salt.
@@ -94,7 +105,7 @@ Requires Node.js 22+ and Docker.
 ```bash
 docker compose up -d          # PostgreSQL 16, schema applied on first start
 npm install
-npm test                      # 10 integration tests against the real database
+npm test                      # 16 integration tests against the real database
 ```
 
 Start the server (`JWT_SECRET` must be at least 32 characters):
@@ -103,10 +114,10 @@ Start the server (`JWT_SECRET` must be at least 32 characters):
 JWT_SECRET="replace-with-a-long-random-string-32+" npm run dev    # PowerShell: $env:JWT_SECRET = "..."; npm run dev
 ```
 
-There is no endpoint to create resources yet; add one directly:
+Register through `POST /auth/register`, then promote that account to admin (the first admin has to be made by hand). After that, the admin creates resources through the API:
 
 ```bash
-docker compose exec db psql -U app -d bookings -c "INSERT INTO resources (name) VALUES ('Room A');"
+docker compose exec db psql -U app -d bookings -c "UPDATE users SET role = 'admin' WHERE email = 'you@example.com';"
 ```
 
 > ⚠️ Tests truncate the tables. Never point `DATABASE_URL` at a database with real data.
@@ -115,8 +126,9 @@ docker compose exec db psql -U app -d bookings -c "INSERT INTO resources (name) 
 
 ```
 db/schema.sql        tables, constraints (idempotent)
-src/bookings.ts      hold / confirm / cancel, concurrency handling
-src/auth.ts          password hashing, register, login
+src/bookings.ts      hold / confirm / cancel / list, concurrency handling
+src/auth.ts          password hashing, register, login, admin check
+src/resources.ts     resource management, availability
 src/app.ts           routes, validation (Zod), error → HTTP mapping
 src/server.ts        entry point
 test/api.test.ts     integration tests (concurrency, expiry, auth, ownership)
@@ -126,7 +138,8 @@ test/api.test.ts     integration tests (concurrency, expiry, auth, ownership)
 
 - Rate limiting on login (needed before exposing it publicly)
 - Refresh tokens and logout / token revocation
-- Availability queries (`GET` free slots) and resource management endpoints
-- Roles (admin vs member)
+- Web frontend
+- Opening hours per resource (availability returns busy ranges; free slots are computed by the client)
+- Pagination and date filters on `GET /bookings`
 - Versioned migrations (the schema is a single idempotent file)
 - CI pipeline

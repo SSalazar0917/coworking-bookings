@@ -13,6 +13,11 @@ CREATE TABLE IF NOT EXISTS resources (
     name text NOT NULL
 );
 
+-- Added after the first release: ALTER keeps this file safe to re-run on existing databases.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'admin'));
+-- Resources are deactivated, never deleted: bookings reference them.
+ALTER TABLE resources ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true;
+
 CREATE TABLE IF NOT EXISTS bookings (
     id              bigserial PRIMARY KEY,
     resource_id     int NOT NULL REFERENCES resources(id),

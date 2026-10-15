@@ -32,6 +32,12 @@ export async function registerUser(pool: Pool, email: string, password: string) 
   }
 }
 
+// Read from the DB on each admin request (not from the JWT) so a demotion takes effect immediately.
+export async function isAdmin(pool: Pool, userId: number) {
+  const { rows } = await pool.query(`SELECT 1 FROM users WHERE id = $1 AND role = 'admin'`, [userId]);
+  return rows.length > 0;
+}
+
 export async function checkCredentials(pool: Pool, email: string, password: string) {
   const { rows } = await pool.query('SELECT id, password_hash FROM users WHERE email = $1', [email]);
   const ok = await verifyPassword(password, rows[0]?.password_hash ?? (await DUMMY_HASH));
