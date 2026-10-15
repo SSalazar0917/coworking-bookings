@@ -1,5 +1,7 @@
 # Coworking Bookings
 
+[![CI](https://github.com/SSalazar0917/coworking-bookings/actions/workflows/ci.yml/badge.svg)](https://github.com/SSalazar0917/coworking-bookings/actions/workflows/ci.yml)
+
 A booking API for shared spaces (meeting rooms, desks) built to be correct under concurrency: **two people can never hold the same resource for overlapping times**, no matter how many requests arrive at once.
 
 **Stack:** Node.js · TypeScript · Fastify · PostgreSQL · Zod · JWT
@@ -142,4 +144,3 @@ test/api.test.ts     integration tests (concurrency, expiry, auth, ownership)
 - Opening hours per resource (availability returns busy ranges; free slots are computed by the client)
 - Pagination and date filters on `GET /bookings`
 - Versioned migrations (the schema is a single idempotent file)
-- CI pipeline
